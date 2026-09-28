@@ -119,6 +119,37 @@ function extractOpenAITextContent(data: unknown): string {
   return ''
 }
 
+function extractErrorMessage(errorData: unknown): string | null {
+  const record = asRecord(errorData)
+  if (!record) return null
+
+  const nestedError = asRecord(record.error)
+  if (nestedError && typeof nestedError.message === 'string') {
+    return nestedError.message
+  }
+  if (typeof record.message === 'string') return record.message
+  if (typeof record.error === 'string') return record.error
+  return null
+}
+
+// Thinking/reasoning modes (for example DeepSeek's reasoning models) reject a named
+// `tool_choice` with a 400 while still supporting tool use when the model picks the
+// tool itself.
+const FORCED_TOOL_CHOICE_REJECTION_HINTS = [
+  'tool_choice',
+  'tool choice',
+  'toolchoice',
+]
+
+function isForcedToolChoiceRejection(errorData: unknown): boolean {
+  const message = extractErrorMessage(errorData)
+  if (!message) return false
+  const normalized = message.toLowerCase()
+  return FORCED_TOOL_CHOICE_REJECTION_HINTS.some(hint =>
+    normalized.includes(hint),
+  )
+}
+
 async function buildSystemMessageContent(args: {
   model: string
   systemPromptProfile: SystemPromptProfile
@@ -219,6 +250,11 @@ Do NOT include any other text. Do NOT call any other tool.`
         },
       ]
 
+      const forcedToolChoice = {
+        type: 'function',
+        function: { name: 'Write' },
+      }
+
       const testPayload: Record<string, unknown> = {
         model: selectedModel,
         messages: [
@@ -226,7 +262,7 @@ Do NOT include any other text. Do NOT call any other tool.`
           { role: 'user', content: userPrompt },
         ],
         tools,
-        tool_choice: { type: 'function', function: { name: 'Write' } },
+        tool_choice: forcedToolChoice,
         max_tokens: Math.max(parseInt(maxTokens) || 1024, 256),
         temperature: 0,
         stream: false,
@@ -268,29 +304,55 @@ Do NOT include any other text. Do NOT call any other tool.`
         headers.Authorization = `Bearer ${apiKey}`
       }
 
-      const response = await fetchWithTimeout(
-        testURL,
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(testPayload),
-        },
-        timeoutMs,
-      )
+      const sendRequest = async (toolChoice: unknown): Promise<Response> =>
+        await fetchWithTimeout(
+          testURL,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ ...testPayload, tool_choice: toolChoice }),
+          },
+          timeoutMs,
+        )
+
+      let response = await sendRequest(forcedToolChoice)
+      let errorData: unknown = null
+
+      if (!response.ok && response.status === 400) {
+        const rejectionData = (await response
+          .json()
+          .catch(() => null)) as unknown
+
+        if (isForcedToolChoiceRejection(rejectionData)) {
+          debugLogger.api('CONNECTION_TEST_TOOL_CHOICE_DOWNGRADE', {
+            provider: selectedProvider,
+            endpoint: endpointPath,
+            model: selectedModel,
+            status: response.status,
+          })
+
+          onProgress?.({
+            success: false,
+            phase: 'request',
+            attempt,
+            maxAttempts: 1 + networkRetryCount,
+            message: `${endpointName} rejected the forced tool choice; retrying with tool_choice "auto"...`,
+            endpoint: endpointPath,
+            fallbackStep: fallbackStepName,
+          })
+
+          response = await sendRequest('auto')
+        } else {
+          errorData = rejectionData
+        }
+      }
 
       if (!response.ok) {
-        const errorData = (await response.json().catch(() => null)) as unknown
-        const errorRecord = asRecord(errorData)
-        const nestedErrorMessage = (() => {
-          const nestedError = asRecord(errorRecord?.error)
-          const nestedMessage = nestedError?.message
-          return typeof nestedMessage === 'string' ? nestedMessage : null
-        })()
+        if (errorData === null) {
+          errorData = (await response.json().catch(() => null)) as unknown
+        }
         const errorMessage =
-          nestedErrorMessage ||
-          (typeof errorRecord?.message === 'string'
-            ? errorRecord.message
-            : null) ||
+          extractErrorMessage(errorData) ||
           response.statusText ||
           `HTTP ${response.status}`
 

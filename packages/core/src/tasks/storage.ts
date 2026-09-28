@@ -16,7 +16,14 @@ import { getKodeAgentSessionId } from '#protocol/utils/kodeAgentSessionId'
 import { getKodeAgentSessionForkInfo } from '#protocol/utils/kodeAgentSessionForkInfo'
 import { debug as debugLogger } from '#core/utils/debugLogger'
 import { logError } from '#core/utils/log'
-import type { Task, TaskStatus, TaskSummary, TaskUpdate } from './types'
+import { getTaskGraphStatus, wouldCreateTaskCycle } from './graph'
+import type {
+  Task,
+  TaskGraphStatus,
+  TaskStatus,
+  TaskSummary,
+  TaskUpdate,
+} from './types'
 
 const TASKS_DIRNAME = 'tasks'
 const TASK_FILE_EXT = '.json'
@@ -372,6 +379,12 @@ export function listTaskSummaries(
   }))
 }
 
+export function getTaskGraph(
+  taskListId: string = getTaskListId(),
+): TaskGraphStatus {
+  return getTaskGraphStatus(listTasks(taskListId))
+}
+
 export function getTask(
   taskId: string,
   taskListId: string = getTaskListId(),
@@ -604,6 +617,25 @@ export function addDependency(args: {
       taskListDir: dir,
     })
     if (!a || !b) return { ok: false, error: 'Task not found' }
+
+    if (args.taskId === args.blocksTaskId) {
+      return { ok: false, error: 'A task cannot block itself.' }
+    }
+
+    // A cyclic graph never reaches a ready state, so reject the edge that would
+    // close the loop instead of letting the task list deadlock silently.
+    if (
+      wouldCreateTaskCycle({
+        tasks: listTasksFromDir(dir),
+        taskId: args.taskId,
+        blocksTaskId: args.blocksTaskId,
+      })
+    ) {
+      return {
+        ok: false,
+        error: `Task #${args.taskId} cannot block #${args.blocksTaskId}: that would create a dependency cycle.`,
+      }
+    }
 
     const aBlocks = a.blocks.includes(args.blocksTaskId)
       ? a.blocks

@@ -39,6 +39,7 @@ Model setup includes a **real tool-use verification** step to detect “API resp
 Behavior (Anthropic `/v1/messages` and OpenAI-compatible endpoints):
 
 - Force a `Write` tool call in the request (`tool_choice`).
+- If a provider rejects the forced tool choice (HTTP 400 whose message names `tool_choice`, as thinking/reasoning modes do), retry the request once with `tool_choice` set to `auto`.
 - Locally execute the returned tool call with Kode’s real `Write` tool implementation.
 - Verify the file exists and content matches expected output.
 - Retry network/timeout failures up to 3 times with incremental backoff (+5s each retry) and display progress in the UI.

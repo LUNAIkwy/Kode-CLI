@@ -5,9 +5,11 @@ import {
   addDependency,
   deleteTask,
   getTask,
+  getUnmetBlockers,
+  listTasks,
   updateTask,
 } from '#core/utils/taskStorage'
-import type { TaskStatus, TaskUpdate } from '#core/utils/taskStorage'
+import type { Task, TaskStatus, TaskUpdate } from '#core/utils/taskStorage'
 import { DESCRIPTION, PROMPT } from './prompt'
 
 const statusSchema = z.enum(['pending', 'in_progress', 'completed'])
@@ -48,6 +50,7 @@ type Output =
       taskId: string
       updatedFields: string[]
       statusChange?: { from: TaskStatus; to: TaskStatus | 'deleted' }
+      warnings?: string[]
     }
   | {
       success: false
@@ -107,7 +110,11 @@ export const TaskUpdateTool = {
     if (output.success === false) return output.error
     const fields =
       output.updatedFields.length > 0 ? output.updatedFields.join(', ') : 'ok'
-    return `Updated task #${output.taskId} (${fields})`
+    const warnings =
+      output.warnings && output.warnings.length > 0
+        ? `\nRejected dependencies: ${output.warnings.join('; ')}`
+        : ''
+    return `Updated task #${output.taskId} (${fields})${warnings}`
   },
   async *call(input: Input, context?: ToolUseContext) {
     const taskId = input.taskId.trim()
@@ -206,6 +213,41 @@ export const TaskUpdateTool = {
       return
     }
 
+    // Dependency order is advisory everywhere else, but starting blocked work
+    // breaks the ordering the user asked for. Reject the transition and let the
+    // model pick a task whose blockers are done. Blockers added in this same
+    // call count too, so one request cannot both start a task and block it.
+    if (input.status === 'in_progress' && existing.status !== 'in_progress') {
+      const addedBlockers = (input.addBlockedBy ?? [])
+        .map(id => String(id).trim())
+        .filter(id => id && id !== taskId)
+      const prospect: Task =
+        addedBlockers.length > 0
+          ? {
+              ...existing,
+              blockedBy: [...existing.blockedBy, ...addedBlockers],
+            }
+          : existing
+      const blockers = getUnmetBlockers(prospect, listTasks())
+      if (blockers.length > 0) {
+        const output: Output = {
+          success: false,
+          taskId,
+          updatedFields: [],
+          error: `Task #${taskId} is blocked by ${blockers
+            .map(id => `#${id}`)
+            .join(', ')}. Complete or remove those dependencies first.`,
+          ...(statusChange ? { statusChange } : {}),
+        }
+        yield {
+          type: 'result',
+          data: output,
+          resultForAssistant: this.renderResultForAssistant(output),
+        }
+        return
+      }
+    }
+
     if (isTaskStatus(input.status) && input.status !== existing.status) {
       update.status = input.status
       updatedFields.push('status')
@@ -243,11 +285,16 @@ export const TaskUpdateTool = {
     }
 
     // Dependencies (best-effort)
+    const dependencyErrors: string[] = []
     if (Array.isArray(input.addBlocks) && input.addBlocks.length > 0) {
       for (const other of input.addBlocks) {
         if (!other || other === taskId) continue
         const res = addDependency({ taskId, blocksTaskId: String(other) })
-        if (res.ok) updatedFields.push('blocks')
+        if ('error' in res) {
+          dependencyErrors.push(`blocks #${other} (${res.error})`)
+        } else {
+          updatedFields.push('blocks')
+        }
       }
     }
     if (Array.isArray(input.addBlockedBy) && input.addBlockedBy.length > 0) {
@@ -257,7 +304,11 @@ export const TaskUpdateTool = {
           taskId: String(blocker),
           blocksTaskId: taskId,
         })
-        if (res.ok) updatedFields.push('blockedBy')
+        if ('error' in res) {
+          dependencyErrors.push(`blockedBy #${blocker} (${res.error})`)
+        } else {
+          updatedFields.push('blockedBy')
+        }
       }
     }
 
@@ -266,6 +317,7 @@ export const TaskUpdateTool = {
       taskId,
       updatedFields: Array.from(new Set(updatedFields)),
       ...(statusChange ? { statusChange } : {}),
+      ...(dependencyErrors.length > 0 ? { warnings: dependencyErrors } : {}),
     }
     emitReminderEvent('task:changed', {
       agentId: context?.agentId,
